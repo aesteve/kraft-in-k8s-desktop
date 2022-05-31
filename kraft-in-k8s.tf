@@ -5,30 +5,45 @@ resource "kubernetes_namespace" "kafka_ns" {
 }
 
 locals {
-  controller_port      = 29093
-  external_port        = 9092
-  internal_port        = 9091
-  cluster_id           = "3Db5QLSqSZieL3rJBUUegA"
+  cluster_id = "3Db5QLSqSZieL3rJBUUegA"
+  ports = {
+    "internal"    : {
+      protocol  = "TCP"
+      container = 9091,
+      host      = 9091,
+    },
+    "external"    : {
+      protocol  = "TCP"
+      container = 9092,
+      host      = 9092,
+    },
+    "controller"  : {
+      protocol  = "TCP"
+      container = 29093,
+      host      = 29093
+    }
+  }
   controller_addresses =  [
     for i in range(var.nb_brokers) :
-      "${i}@${var.broker_app_name}-${i}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:${local.controller_port}"
+      # eg: 0@broker-0.kafka-svc.kafka.svc.cluster.local:9091
+      "${i}@${var.broker_app_name}-${i}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:${local.ports.controller.host}"
   ]
-  export_commands      = [
+  start_exports      = [
     "export KAFKA_BROKER_ID=$${POD_NAME##*-}",
     "export KAFKA_NODE_ID=$${POD_NAME##*-}",
-    "export KAFKA_ADVERTISED_LISTENERS=INTERNAL://$${POD_NAME}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}:${local.internal_port},EXTERNAL://${var.advertised_hostname}:${local.external_port}",
+    "export KAFKA_ADVERTISED_LISTENERS=INTERNAL://$${POD_NAME}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}:${local.ports.internal.host},EXTERNAL://${var.advertised_hostname}:${local.ports.external.host}",
   ]
-  start_commands       = [
+  start_scripts       = [
     "/tmp/scripts/update_run.sh",
     "/etc/confluent/docker/run",
   ]
-  broker_start_cmd     = join(" && ", concat(local.export_commands, local.start_commands))
+  broker_start_cmd     = join(" && ", concat(local.start_exports, local.start_scripts))
   broker_kafka_envs    = {
     "CLUSTER_ID": local.cluster_id,
     "PROCESS_ROLES": "broker,controller",
     "CONTROLLER_QUORUM_VOTERS": join(",", local.controller_addresses),
     "LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT",
-    "LISTENERS": "CONTROLLER://:${local.controller_port},INTERNAL://0.0.0.0:${local.internal_port},EXTERNAL://0.0.0.0:${local.external_port}",
+    "LISTENERS": "CONTROLLER://:${local.ports.controller.host},INTERNAL://:${local.ports.internal.host},EXTERNAL://:${local.ports.external.host}",
     # ADVERTISED_LISTENERS ==> at runtime (because depends on $POD_NAME)
     "INTER_BROKER_LISTENER_NAME": "INTERNAL",
     "CONTROLLER_LISTENER_NAMES": "CONTROLLER",
@@ -54,23 +69,14 @@ resource "kubernetes_service" "kafka_svc" {
     selector = {
       app = var.broker_app_name
     }
-    port {
-      name = "external"
-      protocol = "TCP"
-      port = local.external_port
-      target_port = local.external_port
-    }
-    port {
-      name = "internal"
-      protocol = "TCP"
-      port = local.internal_port
-      target_port = local.internal_port
-    }
-    port {
-      name = "controller"
-      protocol = "TCP"
-      port = local.controller_port
-      target_port = local.controller_port
+    dynamic "port" {
+      for_each = local.ports
+      content {
+        name = port.key
+        protocol = port.value.protocol
+        port = port.value.host
+        target_port = port.value.container
+      }
     }
   }
 }
@@ -155,18 +161,12 @@ resource "kubernetes_stateful_set" "kraft_in_k8s" {
 #            name = "KAFKA_JMX_HOSTNAME"
 #            value = "localhost"
 #          }
-
-          port {
-            container_port  = local.external_port
-            name            = "external-port"
-          }
-          port {
-            container_port  = local.internal_port
-            name            = "internal-port"
-          }
-          port {
-            container_port  = local.controller_port
-            name            = "controller-port"
+          dynamic "port" {
+            for_each = local.ports
+            content {
+              container_port = port.value.container
+              name = port.key
+            }
           }
           resources {
             requests = {
