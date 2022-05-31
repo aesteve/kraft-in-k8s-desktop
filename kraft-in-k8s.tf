@@ -4,44 +4,81 @@ resource "kubernetes_namespace" "kafka_ns" {
   }
 }
 
+locals {
+  controller_port      = 29093
+  external_port        = 9092
+  internal_port        = 9091
+  cluster_id           = "3Db5QLSqSZieL3rJBUUegA"
+  controller_addresses =  [
+    for i in range(var.nb_brokers) :
+      "${i}@${var.broker_app_name}-${i}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:${local.controller_port}"
+  ]
+  export_commands      = [
+    "export KAFKA_BROKER_ID=$${POD_NAME##*-}",
+    "export KAFKA_NODE_ID=$${POD_NAME##*-}",
+    "export KAFKA_ADVERTISED_LISTENERS=INTERNAL://$${POD_NAME}.${var.service_name}.${kubernetes_namespace.kafka_ns.id}:${local.internal_port},EXTERNAL://${var.advertised_hostname}:${local.external_port}",
+  ]
+  start_commands       = [
+    "/tmp/scripts/update_run.sh",
+    "/etc/confluent/docker/run",
+  ]
+  broker_start_cmd     = join(" && ", concat(local.export_commands, local.start_commands))
+  broker_kafka_envs    = {
+    "CLUSTER_ID": local.cluster_id,
+    "PROCESS_ROLES": "broker,controller",
+    "CONTROLLER_QUORUM_VOTERS": join(",", local.controller_addresses),
+    "LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT",
+    "LISTENERS": "CONTROLLER://:${local.controller_port},INTERNAL://0.0.0.0:${local.internal_port},EXTERNAL://0.0.0.0:${local.external_port}",
+    # ADVERTISED_LISTENERS ==> at runtime (because depends on $POD_NAME)
+    "INTER_BROKER_LISTENER_NAME": "INTERNAL",
+    "CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+    "DEFAULT_REPLICATION_FACTOR": var.nb_brokers,
+    "OFFSETS_TOPIC_REPLICATION_FACTOR": var.nb_brokers,
+    "GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
+    "TRANSACTION_STATE_LOG_MIN_ISR": "1",
+    "TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+    "KAFKA_LOG_DIRS": "/tmp/kraft-combined-logs"
+  }
+}
+
 resource "kubernetes_service" "kafka_svc" {
   metadata {
-    name = "kafka-headless"
     namespace = kubernetes_namespace.kafka_ns.id
+    name = var.service_name
     labels = {
-      app = "broker"
+      app = var.broker_app_name
     }
   }
   spec {
     cluster_ip = "None"
     selector = {
-      app = "broker"
+      app = var.broker_app_name
     }
     port {
       name = "external"
       protocol = "TCP"
-      port = 9092
-      target_port = 9092
+      port = local.external_port
+      target_port = local.external_port
     }
     port {
       name = "internal"
       protocol = "TCP"
-      port = 9091
-      target_port = 9091
+      port = local.internal_port
+      target_port = local.internal_port
     }
     port {
       name = "controller"
       protocol = "TCP"
-      port = 29093
-      target_port = 29093
+      port = local.controller_port
+      target_port = local.controller_port
     }
   }
 }
 
 resource "kubernetes_config_map" "scripts" {
   metadata {
-    name = "scripts"
     namespace = kubernetes_namespace.kafka_ns.id
+    name = "scripts"
   }
   data = {
     "update_run.sh" = <<EOF
@@ -51,35 +88,31 @@ resource "kubernetes_config_map" "scripts" {
       # Docker workaround: Ignore cub zk-ready
       sed -i 's/cub zk-ready/echo ignore zk-ready/' /etc/confluent/docker/ensure
       # KRaft required step: Format the storage directory with a new cluster ID
-      echo "kafka-storage format -t 3Db5QLSqSZieL3rJBUUegA -c /etc/kafka/kafka.properties" >> /etc/confluent/docker/ensure
+      echo "kafka-storage format -t ${local.cluster_id} -c /etc/kafka/kafka.properties" >> /etc/confluent/docker/ensure
     EOF
   }
 }
 
-
-
 resource "kubernetes_stateful_set" "kraft_in_k8s" {
   metadata {
     namespace = kubernetes_namespace.kafka_ns.id
-    name = "broker"
+    name = var.broker_app_name
     labels = {
-      app = "broker"
+      app = var.broker_app_name
     }
   }
   spec {
-    service_name = "kafka-headless"
-    replicas = 3
-
+    service_name = var.service_name
+    replicas = var.nb_brokers
     selector {
       match_labels = {
-        app = "broker"
+        app = var.broker_app_name
       }
     }
-
     template {
       metadata {
         labels = {
-          app = "broker"
+          app = var.broker_app_name
         }
       }
       spec {
@@ -92,23 +125,13 @@ resource "kubernetes_stateful_set" "kraft_in_k8s" {
         }
         container {
           image = "confluentinc/cp-kafka"
-          name  = "broker"
+          name  = var.broker_app_name
           volume_mount {
             name       = "update-run"
             mount_path = "/tmp/scripts"
           }
           command = ["/bin/bash", "-c", "--" ]
-          args = [
-            "if [ ! -f /tmp/scripts/update_run.sh ]; then echo \"ERROR: Did you forget the update_run.sh file that came with this docker-compose.yml file?\" && exit 1 ; else /tmp/scripts/update_run.sh && export KAFKA_ID=$$(($${POD_NAME##*-} + 1)) && export KAFKA_BROKER_ID=$$KAFKA_ID && export KAFKA_NODE_ID=$$KAFKA_ID && export KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://:29092,INTERNAL://$${POD_NAME}.kafka-headless.${kubernetes_namespace.kafka_ns.id}:9092,EXTERNAL://localhost:9092 && /etc/confluent/docker/run ; fi"
-#            "if [ ! -f /tmp/scripts/update_run.sh ]; then echo \"ERROR: Did you forget the update_run.sh file that came with this docker-compose.yml file?\" && exit 1 ; else /tmp/scripts/update_run.sh && export KAFKA_ID=$$(($${POD_NAME##*-} + 1)) && export KAFKA_BROKER_ID=$$KAFKA_ID && export KAFKA_NODE_ID=$$KAFKA_ID && export KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://:29092,INTERNAL://$${POD_NAME}.kafka-headless.${kubernetes_namespace.kafka_ns.id}:9092,EXTERNAL://localhost:9092 && printf \"node_id=$$KAFKA_NODE_ID\n\" && printf \"broker_id=$$KAFKA_BROKER_ID\" && sleep 9999999 ; fi"
-
-          ]
-#          command = [ "/bin/bash", "-c", "--" ]
-#          args = [ "while true; do sleep 30; done;" ]
-          env {
-            name = "KAFKA_CLUSTER_ID"
-            value = "3Db5QLSqSZieL3rJBUUegA"
-          }
+          args = [ local.broker_start_cmd ]
           env {
             name = "POD_NAME"
             value_from {
@@ -117,63 +140,12 @@ resource "kubernetes_stateful_set" "kraft_in_k8s" {
               }
             }
           }
-# Using env. variable POD_NAME instead
-#          env {
-#            name = "KAFKA_BROKER_ID"
-#            value = "1"
-#          }
-#          env {
-#            name = "KAFKA_NODE_ID"
-#            value = "1"
-#          }
-          env {
-            name = "KAFKA_PROCESS_ROLES"
-            value = "broker,controller"
-          }
-          env {
-            name = "KAFKA_CONTROLLER_QUORUM_VOTERS"
-            value = "1@broker-0.kafka-headless.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:29093,2@broker-1.kafka-headless.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:29093,3@broker-2.kafka-headless.${kubernetes_namespace.kafka_ns.id}.svc.cluster.local:29093"
-          }
-          env {
-            name = "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP"
-            value = "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
-          }
-          env {
-            name = "KAFKA_LISTENERS"
-            value = "PLAINTEXT://:29092,CONTROLLER://:29093,INTERNAL://0.0.0.0:9091,EXTERNAL://0.0.0.0:9092"
-          }
-          env {
-            name = "KAFKA_INTER_BROKER_LISTENER_NAME"
-            value = "PLAINTEXT"
-          }
-          env {
-            name = "KAFKA_CONTROLLER_LISTENER_NAMES"
-            value = "CONTROLLER"
-          }
-#          env {
-#            name = "KAFKA_ADVERTISED_LISTENERS"
-#            value = "PLAINTEXT://:29092,EXTERNAL://localhost:9092"
-#          }
-          env {
-            name = "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR"
-            value = "1"
-          }
-          env {
-            name = "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS"
-            value = "0"
-          }
-          env {
-            name = "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR"
-            value = "1"
-          }
-          env {
-            name = "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"
-            value = "1"
-          }
-          env {
-            name = "KAFKA_LOG_DIRS"
-            value = "/tmp/kraft-combined-logs"
-
+          dynamic "env" {
+            for_each = local.broker_kafka_envs
+            content {
+              name = "KAFKA_${env.key}"
+              value = env.value
+            }
           }
 #          env {
 #            name = "KAFKA_JMX_PORT"
@@ -185,19 +157,42 @@ resource "kubernetes_stateful_set" "kraft_in_k8s" {
 #          }
 
           port {
-            container_port  = 9092
+            container_port  = local.external_port
             name            = "external-port"
           }
           port {
-            container_port  = 9091
+            container_port  = local.internal_port
             name            = "internal-port"
           }
           port {
-            container_port  = 29093
+            container_port  = local.controller_port
             name            = "controller-port"
           }
-          # TODO: appropriate resources here
-          # TODO: liveness_probe here
+          resources {
+            requests = {
+              cpu = 1
+              memory = "256Mi"
+            }
+            limits = {
+              cpu = 1
+              memory = "1024Mi"
+            }
+          }
+#          liveness_probe {
+#            exec {
+#              command = ["/usr/bin/jps | grep -q Kafka"]
+#            }
+#          }
+#          readiness_probe {
+#            tcp_socket {
+#              port = "internal-port"
+#            }
+#            initial_delay_seconds = 1
+#            period_seconds = 1
+#            timeout_seconds = 1
+#            success_threshold = 1
+#            failure_threshold = 3
+#          }
         }
       }
     }
